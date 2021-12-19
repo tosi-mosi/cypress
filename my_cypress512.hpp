@@ -1,0 +1,225 @@
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+#define ROTL64(v, n) ((v) << (n)) | ((v) >> (64 - (n)))
+
+#define HALFROUND64(a, b, c, d) \
+    {                           \
+        a += b;                 \
+        d ^= a;                 \
+        d = ROTL64(d, 32);      \
+        c += d;                 \
+        b ^= c;                 \
+        b = ROTL64(b, 24);      \
+        a += b;                 \
+        d ^= a;                 \
+        d = ROTL64(d, 16);      \
+        c += d;                 \
+        b ^= c;                 \
+        b = ROTL64(b, 15);      \
+    }
+
+template <typename ARR>
+void halfround(ARR& arr) {
+    HALFROUND64(arr[0], arr[1], arr[2], arr[3]);
+}
+
+template <typename ARR1, typename ARR2>
+void perCoordAddRtoL(ARR1& a, const ARR2& b, int len) {
+    for (int i = 0; i < len; ++i) {
+        a[i] += b[i];
+    }
+}
+
+template <typename ARR1, typename ARR2>
+void perCoordXorRtoL(ARR1& a, const ARR2& b, int len) {
+    for (int i = 0; i < len; ++i) {
+        a[i] ^= b[i];
+    }
+}
+
+template <typename ARR1, typename ARR2>
+void assignFromArray(ARR1& a, const ARR2& b, int len, int leftArrShift = 0, int rightArrShift = 0) {
+    for (int i = 0; i < len; ++i) {
+        a[leftArrShift + i] = b[i + rightArrShift];
+    }
+}
+
+std::array<uint64_t, 4> genAuxiliaryKey(const std::array<uint64_t, 8>& masterKey) {
+    std::array<uint64_t, 4> state{0, 0, 0, 0};
+    std::array<uint64_t, 4> Kl{
+        masterKey[0],
+        masterKey[1],
+        masterKey[2],
+        masterKey[3],
+    };
+    std::array<uint64_t, 4> Kr{
+        masterKey[4],
+        masterKey[5],
+        masterKey[6],
+        masterKey[7],
+    };
+
+    perCoordAddRtoL(state, Kl, 4);
+    state[3] ^= 1;
+    halfround(state);
+    halfround(state);
+
+    perCoordAddRtoL(state, Kr, 4);
+    halfround(state);
+    halfround(state);
+
+    perCoordXorRtoL(state, Kl, 4);
+    halfround(state);
+    halfround(state);
+
+    return state;
+}
+
+std::array<std::array<uint64_t, 4>, 14> genRoundKeys(const std::array<uint64_t, 4>& auxKey,
+                                                     const std::array<uint64_t, 8>& masterKey) {
+    std::array<std::array<uint64_t, 4>, 14> roundKeys;
+
+    std::array<uint64_t, 4> tmv{0x000F000F000F000F, 0x000F000F000F000F, 0x000F000F000F000F, 0x000F000F000F000F};
+    std::array<uint64_t, 4> state{0, 0, 0, 0};
+    std::array<uint64_t, 4> K;
+
+    auto ROTLKey = [](std::array<uint64_t, 8>& key) {
+        auto tmp = key[7];
+        for (int i = 1; i < 8; ++i) {
+            key[i] = key[i - 1];
+        }
+        key[0] = tmp;
+    };
+
+    auto roundInitData = masterKey;
+    for (int i = 0; i <= 12; i += 2) {
+        auto genRoundKey = [&]() {
+            K = auxKey;
+            perCoordAddRtoL(K, tmv, 4);
+            perCoordAddRtoL(state, K, 4);
+            halfround(state);
+            halfround(state);
+            perCoordXorRtoL(state, K, 4);
+            halfround(state);
+            halfround(state);
+            perCoordAddRtoL(state, K, 4);
+            return state;
+        };
+
+        assignFromArray(state, roundInitData, 4);
+        roundKeys[i] = genRoundKey();
+        std::for_each(tmv.begin(), tmv.end(), [](uint64_t& el) { el <<= 1; });
+
+        assignFromArray(state, roundInitData, 4, 0, 4);
+        roundKeys[i + 1] = genRoundKey();
+        std::for_each(tmv.begin(), tmv.end(), [](uint64_t& el) { el <<= 1; });
+        ROTLKey(roundInitData);
+    }
+    return roundKeys;
+}
+
+std::array<uint64_t, 8> encryptBlock(const std::array<uint64_t, 8>& plainText,
+                                     const std::array<std::array<uint64_t, 4>, 14> roundKeys) {
+    std::array<uint64_t, 8> cipherText;
+
+    std::array<uint64_t, 4> L, R;
+    std::array<uint64_t, 4> tmp;
+
+    assignFromArray(L, plainText, 4);
+    assignFromArray(R, plainText, 4, 0, 4);
+
+    for (int i = 0; i < 14; ++i) {
+        assignFromArray(tmp, L, 4);
+        perCoordXorRtoL(L, roundKeys[i], 4);
+        halfround(L);
+        halfround(L);
+        perCoordXorRtoL(L, R, 4);
+        assignFromArray(R, tmp, 4);
+    }
+
+    assignFromArray(cipherText, L, 4);
+    assignFromArray(cipherText, R, 4, 4, 0);
+    return cipherText;
+}
+
+std::array<uint64_t, 8> decryptBlock(const std::array<uint64_t, 8>& cipherText,
+                                     const std::array<std::array<uint64_t, 4>, 14> roundKeys) {
+    std::array<uint64_t, 8> decryptedText;
+
+    std::array<uint64_t, 4> L, R;
+    std::array<uint64_t, 4> tmp;
+
+    assignFromArray(L, cipherText, 4);
+    assignFromArray(R, cipherText, 4, 0, 4);
+
+    for (int i = 0; i < 14; ++i) {
+        assignFromArray(tmp, R, 4);
+        perCoordXorRtoL(R, roundKeys[13 - i], 4);
+        halfround(R);
+        halfround(R);
+        perCoordXorRtoL(R, L, 4);
+        assignFromArray(L, tmp, 4);
+    }
+
+    assignFromArray(decryptedText, L, 4);
+    assignFromArray(decryptedText, R, 4, 4, 0);
+    return decryptedText;
+}
+
+std::vector<uint64_t> encryptData(const std::vector<uint64_t> data,
+                                  const std::array<std::array<uint64_t, 4>, 14> roundKeys) {
+    std::vector<uint64_t> cipherText;
+    cipherText.reserve(data.size());
+
+    // iterate through blocks
+    for (int i = 0; i < data.size(); i += 8) {
+        // value initialization will fill array with zeros
+        std::array<uint64_t, 8> blockOfPlainText{};
+        auto nonZeroWordsInBlock = data.size() - i < 8 ? (data.size() % 8) : 8;
+
+        //std::cout << "iter block = " << i << ", nzwib = " << nonZeroWordsInBlock << '\n';
+        // iterate through words in block
+        for (int j = 0; j < nonZeroWordsInBlock; ++j) {
+        	//std::cout << "data = " << data[i+j] << '\n';
+            blockOfPlainText[j] = data[i + j];
+        }
+
+        auto cipheredBlock = encryptBlock(blockOfPlainText, roundKeys);
+
+        std::for_each(std::begin(cipheredBlock), std::end(cipheredBlock), [&cipherText](uint64_t cipheredWord) {
+            cipherText.push_back(cipheredWord);
+        });
+    }
+
+    return cipherText;
+}
+
+// after encryption vec size will be devisible by 8
+std::vector<uint64_t> decryptData(const std::vector<uint64_t> cipherText,
+                                  const std::array<std::array<uint64_t, 4>, 14> roundKeys) {
+    std::vector<uint64_t> data;
+    data.reserve(cipherText.size());
+
+    // iterate through blocks
+    for (int i = 0; i < cipherText.size(); i += 8) {
+        // value initialization will fill array with zeros
+        std::array<uint64_t, 8> blockOfCipherText{};
+
+        // iterate through words in block
+        for (int j = 0; j < 8; ++j) {
+            blockOfCipherText[j] = cipherText[i + j];
+        }
+
+        auto decryptedBlock = decryptBlock(blockOfCipherText, roundKeys);
+
+        std::for_each(std::begin(decryptedBlock), std::end(decryptedBlock), [&data](uint64_t decryptedWord) {
+            data.push_back(decryptedWord);
+        });
+    }
+
+    return data;
+}
